@@ -1,0 +1,429 @@
+import pint
+from pint import UnitRegistry
+
+from pylatexenc.latex2text import LatexNodes2Text
+
+import re
+
+import math
+from math import floor, log10
+
+import logging
+
+from math_verify import LatexExtractionConfig, parse, verify
+
+
+import os, json
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+
+from pylatexenc.latex2text import LatexNodes2Text
+
+
+
+logger = None
+
+ureg = UnitRegistry()
+
+preferred_units = [
+    ureg.m,  # meter (length) - L
+    ureg.kg,  # kilogram (mass) - M
+    ureg.s,  # second (time) - T
+    ureg.degC,  # Degree C (thermodynamic temperature) - Θ
+    ureg.A,  # Ampere (electric current) - I
+    ureg.mol,  # mole (amount of substance) - N
+    ureg.cd,  # candela (luminous intensity) - J
+]
+
+ureg.define("@alias au = AU")
+ureg.define("@alias J = Joules")
+ureg.define("@alias A = amps")
+
+ureg.default_preferred_units = preferred_units
+
+Q_ = ureg.Quantity
+
+
+class RewardConfig:
+    def __init__(
+        self,
+        PENALTY_COEFF: float = 0.05,
+        N_SIG_FIG: int = 4,
+        UNIT_REWARD: float = 0.5,
+        MC_REWARD: float = 1,
+        MC_EXIST_REWARD: float = 0.1,
+    ):
+        self.PENALTY_COEFF = PENALTY_COEFF
+        self.N_SIG_FIG = N_SIG_FIG
+        self.UNIT_REWARD = UNIT_REWARD
+        self.NUMERICAL_REWARD = 1 - UNIT_REWARD  # derived from UNIT_REWARD
+        self.MC_REWARD = MC_REWARD
+        self.MC_EXIST_REWARD = MC_EXIST_REWARD
+
+
+def init_logger(passed_logger=None):
+    """Initialize the global logger if needed."""
+    global logger
+    if passed_logger is not None:
+        logger = passed_logger
+    elif logger is None:
+        logger = logging.getLogger("reward")
+        logger.setLevel(logging.INFO)
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+            )
+            logger.addHandler(handler)
+
+
+def parse_answer(extracted_answer):
+    # split the answer into strings of numerical and unit
+    answer_split = (
+        LatexNodes2Text()
+        .latex_to_text(extracted_answer)
+        .replace(" x ", "*")
+        .replace(" × ", "*")
+        .strip()
+        .split(" ")
+    )
+    if len(answer_split) == 0:
+        numerical_string, unit_string = "", ""
+    elif len(answer_split) == 1:
+        numerical_string, unit_string = answer_split[0], ""
+    else:
+        numerical_string, unit_string = answer_split[0], " ".join(answer_split[1:])
+
+    # dealing with the unit system
+    try:
+        parse_unit = ureg.parse_units(
+            unit_string, as_delta=False
+        )  # from string to `pint.Unit`
+        try:
+            unit_quantity = Q_(
+                1 * parse_unit
+            ).to_preferred()  # convert unit to `preferred_units`
+        except pint.DimensionalityError:
+            unit_quantity = Q_(1 * parse_unit)
+        unit_multiplier, pint_units = unit_quantity.magnitude, unit_quantity.units
+    except Exception as e:
+        unit_multiplier, pint_units = 1, ""
+        logger.warning(
+            f"Exception {e}:\nError when parsing unit '{unit_string}' in '{extracted_answer}'"
+        )
+
+    # dealing with the numerical part
+    try:
+        magnitude = Q_(numerical_string).to_base_units().magnitude * unit_multiplier
+    except Exception as e:
+        magnitude = 0
+        logger.warning(
+            f"Exception {e}:\nError when parsing numerical '{numerical_string}' in '{extracted_answer}'"
+        )
+
+    return magnitude, pint_units
+
+
+def split_num_and_letters(s):
+    match = re.match(r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)([a-zA-Z]*)", s)
+    if match and match.group(1):  # found a number
+        num_part = float(match.group(1))
+        char_part = match.group(2)
+    else:  # no number, assume 1
+        num_part = 1
+        char_part = s
+    return num_part, char_part
+
+
+def extract_answer_from_tag(content):
+    extracted_answer = re.findall(r"<answer>(.*?)</answer>", content, re.DOTALL)
+    if len(extracted_answer):
+        extracted_answer = extracted_answer[0]
+    else:
+        extracted_answer = ""
+    return extracted_answer.strip()
+
+
+def sig_figs(x, precision):
+    if x == 0 or not math.isfinite(x):
+        return x
+    if precision <= 0:
+        raise ValueError("precision must be > 0")
+    return round(x, -int(floor(log10(abs(x)))) + (precision - 1))
+
+
+def abs_percentage_error(true, pred):
+    if true == 0: true += 1e-32
+    return abs((pred - true) / true)
+
+def smooth_penalty(eps, cap=0.5, tau=0.05):
+    return cap * (1 - np.exp(-eps / tau))
+
+
+def format_mc_answer(input):
+    output = input.lower().replace(" ", "").strip(".")
+    return output
+
+def grade_open_end_factual(answer, extracted_answer, reward_config):
+    # parsing เหมือนเดิม -------------------------------------------------
+    correct_answer = answer.split(' ')[0].strip().lower()
+    model_output   = extracted_answer.replace(' ', '').lower()
+    correct_number, correct_letter = split_num_and_letters(correct_answer)
+    model_number,   model_letter   = split_num_and_letters(model_output)
+    reward = None
+    # --------------------------------------------------------------------
+
+    # 1) ให้รางวัลเรื่องหน่วย (ตัวอักษร)
+    if correct_letter == model_letter:
+        unit_reward = reward_config.UNIT_REWARD
+    else:
+        unit_reward = 0
+
+    # 2) ให้รางวัลเรื่องตัวเลข  (ใช้ soft-clip)
+    err = abs_percentage_error(correct_number, model_number)
+    penalty = smooth_penalty(err, cap=reward_config.NUMERICAL_REWARD,
+                            tau=reward_config.PENALTY_COEFF)
+    reward = (reward_config.NUMERICAL_REWARD - penalty), unit_reward
+    return reward
+
+
+def grade_open_end_numerical(answer, extracted_answer, reward_config):
+    # parsing เหมือนเดิม -------------------------------------------------
+    correct_magnitude, correct_pint_units = parse_answer(answer)
+    model_magnitude, model_pint_units = parse_answer(extracted_answer)
+    reward = None
+    # --------------------------------------------------------------------
+
+    # 1) รางวัลเรื่องหน่วย
+    if correct_pint_units == model_pint_units:
+        unit_reward = reward_config.UNIT_REWARD
+    else: 
+        unit_reward = 0   
+
+    # 2) รางวัลเรื่องตัวเลข
+    model_magnitude_sf = sig_figs(model_magnitude, reward_config.N_SIG_FIG)
+    correct_magnitude_sf = sig_figs(correct_magnitude, reward_config.N_SIG_FIG)
+
+    if model_magnitude_sf == correct_magnitude_sf:
+        reward = reward_config.NUMERICAL_REWARD, unit_reward
+    else:                                         # **ไม่ตรง ⇒ คิดโทษแบบโค้ง**
+        err = abs_percentage_error(correct_magnitude, model_magnitude)
+        penalty = smooth_penalty(err, cap=reward_config.NUMERICAL_REWARD,
+                                tau=reward_config.PENALTY_COEFF)
+        reward = (reward_config.NUMERICAL_REWARD - penalty), unit_reward
+    return reward
+
+def extract_numbers_factual(answer: str,
+                            extracted_answer: str):
+    """
+    ดึง ‘ตัวเลข’ ออกมาจากคำตอบฟิสิกส์เชิง factual
+    คืน (correct_number, model_number)   ทั้งคู่เป็น float
+    """
+    # ตัดหน่วยออก → เหลือเฉพาะตัวเลข
+    correct_answer = answer.split()[0].strip().lower()
+    model_output   = extracted_answer.replace(" ", "").lower()
+
+    correct_num, _ = split_num_and_letters(correct_answer)
+    model_num,   _ = split_num_and_letters(model_output)
+
+    return float(correct_num), float(model_num)
+
+
+def extract_numbers_numerical(answer: str,
+                              extracted_answer: str):
+    """
+    ดึง ‘ตัวเลข’ ออกมาจากคำตอบแบบตัวเลข + หน่วย
+    คืน (correct_magnitude, model_magnitude)   ทั้งคู่เป็น float
+    """
+    correct_mag, _ = parse_answer(answer)
+    model_mag,   _ = parse_answer(extracted_answer)
+
+    return float(correct_mag), float(model_mag)
+
+def grade_mc_question(answer, extracted_answer, option, reward_config):
+    formatted_model_answer = format_mc_answer(extracted_answer)
+    formatted_answer = format_mc_answer(answer)
+    formatted_option = [format_mc_answer(o) for o in option]
+
+    if formatted_model_answer == formatted_answer:
+        return reward_config.MC_REWARD
+    elif formatted_model_answer in formatted_option:
+        return reward_config.MC_EXIST_REWARD
+    else:
+        return 0
+
+
+
+def physics_accuracy_reward(completions, passed_logger=None, reward_config=None, **kwargs):
+    init_logger(passed_logger)
+
+    if reward_config is None:
+        reward_config = RewardConfig()
+        
+    # Read the completions
+    completion_contents = [completion[0]["content"] for completion in completions]
+    answers = kwargs["answer"]
+    options = kwargs["options"]
+
+    rewards = []
+
+    # Loop through the batch
+    for content, answer, option in zip(completion_contents, answers, options):
+        # Extract the answer in the answer tag
+        extracted_answer = extract_answer_from_tag(content)
+        logger.info(f"Correct: '{answer}' Model: '{extracted_answer}'")
+
+        # If it is an open-end questions
+        if len(option) == 0:
+            # If the answer is something like [0.3d, ma, 32q, 4F, etc], but not [2.1 cm, 3 m^3, etc]
+            if bool(re.search(r"[a-zA-Z]", answer.split(" ")[0])):
+                reward = grade_open_end_factual(answer, extracted_answer, reward_config)
+
+            else:  # if the answer is in the format {number unit(optional)}
+                reward = grade_open_end_numerical(
+                    answer, extracted_answer, reward_config
+                )
+
+        # If it is a multiple-choice questions
+        else:
+            reward = grade_mc_question(answer, extracted_answer, option, reward_config)
+
+        rewards.append(reward)
+
+    return rewards
+
+
+def physics_accuracy_reward_evaluation(completions, passed_logger=None, reward_config=None, **kwargs):
+    init_logger(passed_logger)
+
+    if reward_config is None:
+        reward_config = RewardConfig()
+        
+    # Read the completions
+    completion_contents = [completion[0]["content"] for completion in completions]
+    answers = kwargs["answer"]
+    options = kwargs["options"]
+
+    rewards = []
+
+    # Loop through the batch
+    for content, answer, option in zip(completion_contents, answers, options):
+        # Extract the answer in the answer tag
+        extracted_answer = extract_answer_from_tag(content)
+        logger.info(f"Correct: '{answer}' Model: '{extracted_answer}'")
+
+        # If it is an open-end questions
+        if len(option) == 0:
+            # If the answer is something like [0.3d, ma, 32q, 4F, etc], but not [2.1 cm, 3 m^3, etc]
+            if bool(re.search(r"[a-zA-Z]", answer.split(" ")[0])):
+                reward = grade_open_end_factual(answer, extracted_answer, reward_config)
+
+            else:  # if the answer is in the format {number unit(optional)}
+                reward = grade_open_end_numerical(
+                    answer, extracted_answer, reward_config
+                )
+
+            reward = (reward, "open_end")
+
+        # If it is a multiple-choice questions
+        else:
+            reward = grade_mc_question(answer, extracted_answer, option, reward_config)
+            reward = (reward, "mc")
+
+        rewards.append(reward)
+
+    return rewards
+
+from typing import List, Dict, Any
+
+def physics_accuracy_reward_extended(
+        completions,
+        passed_logger=None,
+        reward_config=None,
+        return_details: bool = False,
+        **kwargs):
+
+    init_logger(passed_logger)
+    if reward_config is None:
+        reward_config = RewardConfig()
+
+    contents = [c[0]["content"] for c in completions]
+    answers  = kwargs["answer"]
+    options  = kwargs["options"]
+
+    results = []
+
+    for content, answer, option in zip(contents, answers, options):
+        pred = extract_answer_from_tag(content)
+        logger.info(f"Correct: '{answer}' Model: '{pred}'")
+
+        # -------------------- OPEN-END --------------------
+        if len(option) == 0:
+            if bool(re.search(r"[a-zA-Z]", answer.split()[0])):          # factual
+                num_r, unit_r = grade_open_end_factual(answer, pred, reward_config)
+                c_val, p_val  = extract_numbers_factual(answer, pred)
+            else:                                                        # numerical
+                num_r, unit_r = grade_open_end_numerical(answer, pred, reward_config)
+                c_val, p_val  = extract_numbers_numerical(answer, pred)
+
+            total_reward = num_r + unit_r
+            q_type = "open_end"
+
+        # ---------------- MULTIPLE-CHOICE ----------------
+        else:
+            total_reward = grade_mc_question(answer, pred, option, reward_config)
+            q_type = "mc"
+            c_val, p_val = None, None   # ไม่เกี่ยวกับตัวเลข
+
+        # -------------- สร้าง details --------------------
+        if return_details:
+            results.append({
+                "reward":        total_reward,
+                "type":          q_type,
+                "correct":       answer,
+                "pred":          pred,
+                "correct_value": c_val,
+                "pred_value":    p_val
+            })
+        else:
+            results.append(total_reward)
+
+    return results
+
+
+
+def format_reward(completions, **kwargs):
+    """Reward function that checks if the completion has a specific format."""
+    pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
+    completion_contents = [completion[0]["content"] for completion in completions]
+    matches = [re.match(pattern, content) for content in completion_contents]
+    rewards_list = [1.0 if match else 0.0 for match in matches]
+    return [1.0 if match else 0.0 for match in matches]
+
+
+def maths_accuracy_reward(completions, **kwargs):
+    """Reward function that checks if the completion is the same as the ground truth."""
+    solutions = kwargs["solution"]
+    completion_contents = [completion[0]["content"] for completion in completions]
+    rewards = []
+    for content, solution in zip(completion_contents, solutions):
+        gold_parsed = parse(
+            solution,
+            extraction_mode="first_match",
+            extraction_config=[LatexExtractionConfig()],
+        )
+        answer_parsed = parse(
+            content,
+            extraction_mode="first_match",
+            extraction_config=[LatexExtractionConfig()],
+        )
+        if len(gold_parsed) != 0:
+            try:
+                rewards.append(float(verify(answer_parsed, gold_parsed)))
+            except Exception:
+                rewards.append(0.0)
+        else:
+            rewards.append(1.0)
+    return rewards
