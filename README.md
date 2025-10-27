@@ -4,4 +4,4 @@ This repository contains the dissertation and associated code for:
 ## Dissertation PDF
 Click below to view the full paper:
 
-[![View PDF](https://img.shields.io/badge/Open%20PDF-blue?style=for-the-badge&logo=adobeacrobatreader)](./dissertation_20649126%20(3).pdf)
+[![View PDF](https://img.shields.io/badge/Open%20PDF-blue?style=for-the-badge&logo=adobeacrobatreader)](./dissertation.pdf)
