@@ -5,3 +5,7 @@ This repository contains the dissertation and associated code for:
 Click below to view the full paper:
 
 [![View PDF](https://img.shields.io/badge/Open%20PDF-blue?style=for-the-badge&logo=adobeacrobatreader)](./dissertation.pdf)
+
+## Code Archive
+Download the full implementation:
+[code](./code)
