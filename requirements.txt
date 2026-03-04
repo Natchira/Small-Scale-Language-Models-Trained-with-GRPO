@@ -1,0 +1,6 @@
+fastapi==0.111.0
+transformers==4.47.1
+torch==2.7.1
+peft==0.18.1
+uvicorn==0.41.0
+accelerate==1.2.1
