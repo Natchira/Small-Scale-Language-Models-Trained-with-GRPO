@@ -22,12 +22,18 @@ Developed a lightweight and efficient approach to improve LLM reasoning under li
 
 ## Results
 Evaluated on 199 physics problems (dialogue format):
+
 Accuracy: 45% → 82%
+
 Multiple-choice: 45% → 85%
+
 Open-ended: 46% → 76%
+
 Format adherence: ~98%
 
 ## Key Contributions
 Designed reward function combining reasoning structure and answer correctness
+
 Improved numerical reasoning using absolute percentage error (APE) penalty
+
 Achieved strong performance with significantly lower resource requirements
